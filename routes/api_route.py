@@ -1,5 +1,5 @@
 from flask import Blueprint, request, jsonify, render_template
-from flask_jwt_extended import jwt_required
+from flask_jwt_extended import jwt_required,create_access_token
 from werkzeug.utils import secure_filename
 import os
 import time
@@ -14,6 +14,7 @@ from deepface import DeepFace
 from retinaface import RetinaFace
 import cv2
 import numpy as np
+from psycopg2.extras import DictCursor
 from mtcnn import MTCNN
 
 api_route_bp = Blueprint('api_route_bp', __name__)
