@@ -4,7 +4,7 @@ from werkzeug.utils import secure_filename
 import os
 import time
 from datetime import datetime
-from services.database import save_user, get_user_by_credentials, save_presence, check_presence, get_history, get_employees, delete_employee, get_employee_by_id
+from services.database import save_user, get_user_by_credentials, save_presence, check_presence, get_history, get_employees, delete_employee, get_employee_by_id,get_db_connection
 from services.face_recognition import load_h5_embeddings, find_matching_face, update_dataset
 from utils.image_processing import crop_and_save_face
 from utils.file import allowed_file
@@ -438,8 +438,8 @@ def twins():
 
         detection_start = time.time()
         image = cv2.imread(temp_path)
-        detector = MTCNN()
-        faces = detector.detect_faces(image)
+        # detector = MTCNN()
+        faces = RetinaFace.detect_faces(image)
         detection_time = time.time() - detection_start
 
         if faces:
@@ -722,3 +722,315 @@ def get_attendance_month():
         return jsonify({"success": False, "message": str(e)}), 500
     finally:
         conn.close()
+        
+        
+@api_route_bp.route('/twinsdua', methods=['POST'])
+def twinsdua():
+    start_time = time.time()
+    temp_path = Config.UPLOAD_FOLDER
+
+    try:
+        # Handle file upload
+        if 'file' not in request.files:
+            return jsonify({
+                'status': 'error',
+                'message': 'No image file provided'
+            }), 400
+            
+        file = request.files['file']
+        if not file or file.filename == '':
+            return jsonify({
+                'status': 'error',
+                'message': 'Empty file'
+            }), 400
+            
+        if not allowed_file(file.filename):
+            return jsonify({
+                'status': 'error',
+                'message': 'Invalid file type'
+            }), 400
+
+        # Save and process file
+        filename = secure_filename(file.filename)
+        temp_path = os.path.join(Config.UPLOAD_FOLDER, f"temp_{filename}")
+        file.save(temp_path)
+
+        # Process image with detailed timing
+        try:
+            # Anti-spoofing check first with timing
+            spoof_start = time.time()
+            spoof_result = DeepFace.extract_faces(
+                img_path=temp_path,
+                anti_spoofing=True
+            )
+            spoof_time = time.time() - spoof_start
+
+            if not spoof_result or len(spoof_result) == 0:
+                return jsonify({
+                    'status': 'error',
+                    'message': 'No face detected',
+                    'data': {'error_code': 'no_face_detected'}
+                }), 400
+
+            face_data = spoof_result[0]
+            is_real = face_data.get('is_real', False)
+            spoof_confidence = float(face_data.get('confidence', 0))
+
+            if not is_real:
+                return jsonify({
+                    'status': 'error',
+                    'message': 'Spoof detected. Please use a real face.',
+                    'data': {
+                        'error_code': 'spoof_detected',
+                        'is_real': is_real,
+                        'spoof_confidence': spoof_confidence
+                    },
+                    'timing': {
+                        'spoofing': f"{spoof_time:.3f}s",
+                        'total': f"{time.time() - start_time:.3f}s"
+                    }
+                }), 400
+
+            # Continue with face detection if real face
+            detection_start = time.time()
+            image = cv2.imread(temp_path)
+            detector = MTCNN()
+            faces = detector.detect_faces(image)
+            detection_time = time.time() - detection_start
+
+            if not faces:
+                return jsonify({
+                    'status': 'error',
+                    'message': 'No face detected in image',
+                    'data': {'error_code': 'no_face_detected'},
+                    'timing': {
+                        'spoofing': f"{spoof_time:.3f}s",
+                        'detection': f"{detection_time:.3f}s",
+                        'total': f"{time.time() - start_time:.3f}s"
+                    }
+                }), 400
+
+            # Time face processing
+            process_start = time.time()
+            x, y, width, height = faces[0]['box']
+            margin = 20
+            x = max(x - margin, 0)
+            y = max(y - margin, 0)
+            width += margin * 2
+            height += margin * 2
+            
+            cropped_face = image[y:y+height, x:x+width]
+            resized_face = cv2.resize(cropped_face, (250, 250))
+            file_path = os.path.join(Config.UPLOAD_FOLDER, filename)
+            cv2.imwrite(file_path, resized_face)
+            process_time = time.time() - process_start
+            
+            # Continue with embedding generation and matching with timing
+            embedding_start = time.time()
+            embedding_obj = DeepFace.represent(
+                img_path=file_path,
+                model_name=Config.FACE_RECOGNITION_MODEL,
+                detector_backend=Config.FACE_DETECTION_MODEL,
+                enforce_detection=False,  # Changed to False since we already detected face
+                align=True
+            )
+            embedding_time = time.time() - embedding_start
+
+            # Time matching
+            matching_start = time.time()
+            embeddings = load_h5_embeddings()
+            current_embedding = np.array(embedding_obj[0]['embedding'])
+            matched_name, similarity = find_matching_face(current_embedding, embeddings)
+            matching_time = time.time() - matching_start
+            os.remove(file_path)
+            if not matched_name:
+                response_data = {
+                    'status': 'error',
+                    'message': 'No matching face found in database',
+                    'data': {
+                        'error_code': 'face_not_found',
+                        'matched_name': None,
+                        'confidence': None,
+                        'is_real': is_real,
+                        'spoof_confidence': spoof_confidence
+                    },
+                    'timing': {
+                        'spoofing': f"{spoof_time:.3f}s",
+                        'detection': f"{detection_time:.3f}s",
+                        'processing': f"{process_time:.3f}s",
+                        'embedding': f"{embedding_time:.3f}s",
+                        'matching': f"{matching_time:.3f}s",
+                        'total': f"{time.time() - start_time:.3f}s"
+                    }
+                }
+                print(response_data)
+                return jsonify(response_data), 404
+
+            # Success response with detailed timing
+            response_data = {
+                'status': 'success',
+                'message': 'Face recognition successful',
+                'data': {
+                    'matched_name': matched_name,
+                    'confidence': float(similarity),
+                    'filename': filename,
+                    'is_real': is_real,
+                    'spoof_confidence': spoof_confidence
+                },
+                'timing': {
+                    'spoofing': f"{spoof_time:.3f}s",
+                    'detection': f"{detection_time:.3f}s",
+                    'processing': f"{process_time:.3f}s",
+                    'embedding': f"{embedding_time:.3f}s",
+                    'matching': f"{matching_time:.3f}s",
+                    'total': f"{time.time() - start_time:.3f}s"
+                }
+            }
+            print(response_data)
+            return jsonify(response_data), 200
+
+        except Exception as e:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise e
+
+    except Exception as e:
+        response_data = {
+           'status': 'error',
+            'message': 'Face could not be detected in face recognition.',
+            'data': {'error_code': 'no_face_detected'}
+        }
+        print(response_data)
+        return jsonify(response_data), 400
+
+    finally:
+        # Clean up temp files
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception as e:
+                print(f"Error removing temp file: {e}")
+                
+@api_route_bp.route('/twinstiga', methods=['POST'])
+def twinstiga():
+    start_time = time.time()
+    temp_path = None
+
+    try:
+        if 'file' not in request.files:
+            return jsonify({'status': 'error', 'message': 'No image file provided'}), 400
+
+        file = request.files['file']
+        if not file or file.filename == '':
+            return jsonify({'status': 'error', 'message': 'Empty file'}), 400
+
+        if not allowed_file(file.filename):
+            return jsonify({'status': 'error', 'message': 'Invalid file type'}), 400
+        
+        # Get form data
+        # location_type = request.form.get('location_type')
+        # office_name = request.form.get('office_name')
+        # latitude = request.form.get('latitude')
+        # longitude = request.form.get('longitude')
+        # timestamp = request.form.get('timestamp')
+
+        # if not all([location_type, office_name, latitude, longitude, timestamp]):
+        #     return jsonify({
+        #         'status': 'error',
+        #         'message': 'Missing required fields'
+        #     }), 400
+        
+        filename = secure_filename(file.filename)
+        temp_path = os.path.join(Config.UPLOAD_FOLDER, f"temp_{filename}")
+        file.save(temp_path)
+
+        spoof_result = DeepFace.extract_faces(img_path=temp_path, anti_spoofing=True)
+        # if not spoof_result or len(spoof_result) == 0:
+        #     return jsonify({
+        #         'status': 'error',
+        #         'message': 'No face detected',
+        #         'data': {'error_code': 'no_face_detected'}
+        #     }), 400
+
+        face_data = spoof_result[0]
+        is_real = face_data.get('is_real', False)
+        spoof_confidence = float(face_data.get('confidence', 0))
+
+        if not is_real:
+            return jsonify({
+                'status': 'error',
+                'message': 'Spoof detected. Please use a real face.',
+                'data': {'error_code': 'spoof_detected'}
+            }), 400
+
+        image = cv2.imread(temp_path)
+        detector = RetinaFace
+        faces = detector.detect_faces(image)
+        if not faces:
+            return jsonify({
+                'status': 'error',
+                'message': 'No face detected in image',
+                'data': {'error_code': 'no_face_detected'}
+            }), 400
+
+        embedding_obj = DeepFace.represent(
+            img_path=temp_path,
+            model_name=Config.FACE_RECOGNITION_MODEL,
+            detector_backend=Config.FACE_DETECTION_MODEL,
+            enforce_detection=True,
+            align=True
+        )
+
+        embeddings = load_h5_embeddings()
+        current_embedding = np.array(embedding_obj[0]['embedding'])
+        matched_name, similarity = find_matching_face(current_embedding, embeddings)
+
+        if not matched_name:
+            response_data = {
+                'status': 'error',
+                'message': 'No matching face found in database',
+                'data': {
+                    'error_code': 'face_not_found',
+                    'matched_name': None,
+                    'confidence': None
+                }
+            }
+            print(response_data)
+            return jsonify(response_data), 404
+
+        response_data = {
+            'status': 'success',
+            'message': 'Face recognition successful',
+            'data': {
+                'matched_name': matched_name,
+                'confidence': float(similarity),
+                'is_real': is_real,
+                'spoof_confidence': spoof_confidence
+            },
+            'timing': {
+                'total': f"{time.time() - start_time:.3f}s"
+            },
+            # 'location': {
+            #     'location_type': location_type,
+            #     'office_name': office_name,
+            #     'latitude': latitude,
+            #     'longitude': longitude,
+            #     'timestamp': timestamp,
+            # },
+        }
+        print(response_data)
+        return jsonify(response_data), 200
+    except Exception as e:
+        response_data = {
+            'status': 'error',
+            'message': 'Face covvuld not be detected in face recognition.',
+            'data': {'error_code': 'no_face_detected'}
+        }
+        print(response_data)
+        return jsonify(response_data),  400
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception as e:
+                print(f"Error removing temp file: {e}")
